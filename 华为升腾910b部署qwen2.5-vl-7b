@@ -1,0 +1,150 @@
+ 本教程是在华为910b上运行qwen2.5-7b模型的说明教程，经测试有两条路。其中第一条路qwenvl原生的调用方式可以，但是vllm生成结果不对，
+ 第二条路vllm可正常工作。
+ 
+ 这条路，qwenvl原生的调用方式可以，但是vllm生成结果不对
+ #s1构建镜像
+export CONTAINER_NAME=qwenvl7b
+export IMG_NAME=swr.cn-south-1.myhuaweicloud.com/ascendhub/qwen2.5-vl-7b-instruct:7.1.T2-800I-A2-aarch64
+LOCAL_CACHE_PATH=/app/lyf
+ # 启动推理微服务，使用ASCEND_VISIBLE_DEVICES选择卡号，范围[0，7]，示例选择0,1卡
+docker run -itd \
+     --name=$CONTAINER_NAME \
+     -e ASCEND_VISIBLE_DEVICES=0,1\
+     -e MIS_CONFIG=atlas800ia2-2x32gb-bf16-vllm-default \
+     -v $LOCAL_CACHE_PATH:/opt/mis/lyf \
+     -p 8000:8000 \
+     --shm-size 1gb \
+     $IMG_NAME \
+     bash
+
+
+#s2进入容器,并激活环境
+docker exec -it $CONTAINER_NAME bash
+#参考文档https://segmentfault.com/a/1190000044123073
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+#s3启动服务
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+CUDA_VISIBLE_DEVICES=0,1 vllm serve /opt/mis/lyf/qwen2.5-vl-7b-instruct/MindSDK/Qwen2.5-VL-7B-Instruct \
+  --port 8000 \
+  --host 0.0.0.0 \
+  --dtype bfloat16 \
+  --limit-mm-per-prompt image=1 \
+  --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.85 \
+  --max-model-len 4096 \
+  --max-num-seqs 16 \
+  --swap-space 8 \
+  --disable-log-requests \
+  --allowed-local-media-path /opt/mis/lyf \
+  --served-model-name Qwen2.5-VL-7B-Instruct  # 添加这行，明确指定服务中的模型名称
+
+#s4测试
+
+curl -H 'accept: application/json' \
+     -H 'Content-Type: application/json' \
+     -X 'POST' \
+     -d '{
+       "model": "Qwen2.5-VL-7B-Instruct",
+       "messages": [
+           {
+               "role":"system",
+               "content":"你是一个友好的AI助手。"
+           },
+           {
+               "role":"user",
+               "content":"你好"
+           }
+       ],
+       "max_tokens": 100,
+       "temperature": 0.6,
+       "top_p": 0.6
+     }' http://localhost:8000/v1/chat/completions
+
+
+curl -H 'accept: application/json' -H 'Content-Type: application/json' \
+    -X 'POST' \
+    -d '{
+      "model": "Qwen2.5-VL-7B-Instruct",
+      "messages": [
+          {
+              "role":"system",
+              "content":"你是一个友好的AI助手。"
+          },
+          {
+              "role":"user",
+              "content":[
+                  {"type": "text", "text": "Please describe the image/video/audio"},
+                  {"type": "image_url", "image_url": {"url": "file:/opt/mis/lyf/4-105_jpg.rf.29cddc52c90162051ba14c4dd910ba68.jpg"}}
+              ]
+          }
+      ],
+      "max_tokens": 100,
+      "temperature": 0.6,
+      "top_p": 0.6
+    }' http://localhost:8000/v1/chat/completions
+
+
+# 第二条路vllm可正常工作,
+#使用asscent vllm镜像,调用qwenvl7b, 可行
+
+# 先定义必要的变量（根据你的实际情况修改）
+export DEVICE0=/dev/davinci0
+export DEVICE1=/dev/davinci1
+export LOCAL_CACHE_PATH=/app/lyf 
+export IMAGE=quay.io/ascend/vllm-ascend:v0.10.0rc1-openeuler  
+
+# 执行 docker run 命令（注意每行末尾的反斜杠\后不能有多余字符）
+docker run --rm \
+--name vllm-ascend \
+--device $DEVICE0 \
+--device /dev/davinci_manager \
+--device /dev/devmm_svm \
+--device /dev/hisi_hdc \
+-v $LOCAL_CACHE_PATH:/opt/mis/lyf \
+-v /usr/local/dcmi:/usr/local/dcmi \
+-v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+-v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+-v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /root/.cache:/root/.cache \
+-p 8000:8000 \
+-it $IMAGE bash
+# Install curl
+yum update -y && yum install -y curl
+
+cd /opt/mis/lyf
+python3 qwenvl7b_vllm_910b.py 
+
+
+
+#qwenvl 部署于310
+
+export DEVICE0=/dev/davinci0
+export DEVICE1=/dev/davinci1
+export LOCAL_CACHE_PATH=/app/lyf 
+export IMAGE=quay.io/ascend/vllm-ascend:v0.10.0rc1-openeuler  
+
+# 执行 docker run 命令（注意每行末尾的反斜杠\后不能有多余字符）
+docker run --rm \
+--name vllm-ascend \
+--device $DEVICE0 \
+--device $DEVICE1 \
+--device /dev/davinci_manager \
+--device /dev/devmm_svm \
+--device /dev/hisi_hdc \
+-v $LOCAL_CACHE_PATH:/opt/mis/lyf \
+-v /usr/local/dcmi:/usr/local/dcmi \
+-v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+-v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+-v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /root/.cache:/root/.cache \
+-p 8000:8000 \
+-it $IMAGE bash
+# Install curl
+yum update -y && yum install -y curl
+
+cd /opt/mis/lyf
+python3 qwenvl7b_vllm_910b.py 
