@@ -34,10 +34,10 @@ TASKS = {
 
 # 提示词模板（使用 {categories} 占位符）
 PROMPTS = {
-    "detection_cn": "检测图像中的以下类别：{categories}。以 JSON 格式报告边界框坐标。",
-    #"detection_en": "Locate every instance that belongs to the following categories: {categories}. Report bounding box coordinates in JSON format.",
-    "vqa_cn": "请仔细观察图像，判断图中是否存在以下类别：{categories}。只需回答“是”或“否”。",
-    #"vqa_en": "Observe the image carefully. Is there any {categories}? Answer only 'yes' or 'no'.",
+    #"detection_cn": "检测图像中的以下类别：{categories}。以 JSON 格式报告边界框坐标。",
+    "detection_en": "Locate every instance that belongs to the following categories: {categories}. Report bounding box coordinates in JSON format. When there are multiple targets, only a maximum of 10 rectangular boxes shall be returned.",
+    #"vqa_cn": "请仔细观察图像，判断图中是否存在以下类别：{categories}。只需回答“是”或“否”。",
+    "vqa_en": "Observe the image carefully. Is there any {categories}? Answer only 'yes' or 'no'.",
 }
 
 # 默认实验根目录
