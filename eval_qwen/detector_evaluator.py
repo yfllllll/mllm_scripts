@@ -13,7 +13,8 @@ import csv
 from io import BytesIO
 from typing import Dict, List, Tuple, Optional, Any
 from PIL import Image, ImageDraw, ImageFont
-from openai import OpenAI
+import time
+from openai import OpenAI, APIConnectionError, APIStatusError, RateLimitError, APITimeoutError
 
 # 颜色定义
 additional_colors = ['red', 'green', 'blue', 'yellow', 'orange', 'pink', 'purple',
@@ -50,17 +51,49 @@ class DetectorEvaluator:
         image.save(buffered, format="JPEG")
         return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-    def call_api(self, messages: List[Dict]) -> str:
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                max_tokens=self.max_tokens,
-                temperature=0,
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            raise RuntimeError(f"API调用失败: {e}")
+
+
+    def call_api(self, messages: List[Dict], max_retries: int = 2) -> str:
+        """调用 API，支持超时和自动重试"""
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                # 设置超时：连接超时 10s，读取超时 120s
+                client = OpenAI(
+                    base_url=self.api_base,
+                    api_key="EMPTY",
+                    timeout=120.0,   # 总超时时间
+                    max_retries=0    # 我们手动控制重试
+                )
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    max_tokens=self.max_tokens,
+                    temperature=0,
+                )
+                return response.choices[0].message.content
+            except (APIConnectionError, APITimeoutError, ConnectionError, TimeoutError) as e:
+                last_error = e
+                if attempt < max_retries:
+                    wait_time = 2 ** attempt  # 指数退避：1s, 2s, 4s...
+                    print(f"  网络超时，{wait_time}秒后重试 (尝试 {attempt+1}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    raise RuntimeError(f"API调用失败，已达最大重试次数: {e}")
+            except (APIStatusError, RateLimitError) as e:
+                # 服务端错误或限流，也可以重试
+                last_error = e
+                if attempt < max_retries:
+                    wait_time = 2 ** attempt
+                    print(f"  API状态错误 {e.status_code}，{wait_time}秒后重试")
+                    time.sleep(wait_time)
+                else:
+                    raise RuntimeError(f"API调用失败: {e}")
+            except Exception as e:
+                # 其他未知错误，不重试直接抛出
+                raise RuntimeError(f"API调用失败: {e}")
+        # 理论上不会执行到这里
+        raise RuntimeError(f"API调用失败: {last_error}")
 
     def parse_json(self, text: str) -> str:
         lines = text.splitlines()
@@ -178,7 +211,7 @@ class DetectorEvaluator:
                 prompt = prompt_template.format(categories=categories_str)
             else:  # vqa
                 # VQA模式提示词也支持占位符替换
-                categories_str = ", ".join(categories)
+                categories_str = ",".join(categories)
                 prompt = prompt_template.format(categories=categories_str) if "{categories}" in prompt_template else prompt_template
 
             messages = [{

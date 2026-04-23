@@ -255,7 +255,7 @@ def main():
                         model_name=model_name,
                         prompt_template=prompt_text,
                         mode=mode,
-                        delay=1.0
+                        delay=2.0
                     )
                     stats["experiment_id"] = exp_id
                     stats["prompt_key"] = prompt_key
