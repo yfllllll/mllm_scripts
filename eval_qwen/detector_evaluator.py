@@ -15,7 +15,9 @@ from typing import Dict, List, Tuple, Optional, Any
 from PIL import Image, ImageDraw, ImageFont
 import time
 from openai import OpenAI, APIConnectionError, APIStatusError, RateLimitError, APITimeoutError
-
+import traceback
+import requests
+import traceback
 # 颜色定义
 additional_colors = ['red', 'green', 'blue', 'yellow', 'orange', 'pink', 'purple',
                      'brown', 'gray', 'beige', 'turquoise', 'cyan', 'magenta',
@@ -24,11 +26,18 @@ additional_colors = ['red', 'green', 'blue', 'yellow', 'orange', 'pink', 'purple
 
 
 class DetectorEvaluator:
-    def __init__(self, api_base: str, model_name: str = "QwenVl", max_tokens: int = 4096):
+    def __init__(self, api_base: str, model_name: str = "QwenVl", max_tokens: int = 4096, request_timeout: float = 60.0, max_retries: int = 1):
         self.api_base = api_base
         self.model_name = model_name
         self.max_tokens = max_tokens
-        self.client = OpenAI(base_url=api_base, api_key="EMPTY")
+        self.request_timeout = request_timeout
+        self.max_retries = max_retries
+        self.client = OpenAI(
+            base_url=api_base,
+            api_key="EMPTY",
+            timeout=request_timeout,
+            max_retries=0,
+        )
 
     def resize_image_max_side(self, image: Image.Image, max_size: int = 1280) -> Tuple[Image.Image, float, float]:
         """等比缩放图像，返回缩放后的图像和宽高缩放因子"""
@@ -48,53 +57,60 @@ class DetectorEvaluator:
 
     def pil_to_base64(self, image: Image.Image) -> str:
         buffered = BytesIO()
-        image.save(buffered, format="JPEG")
+        image.save(buffered, format="JPEG", quality=100, optimize=True)
         return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
 
-    def call_api(self, messages: List[Dict], max_retries: int = 2) -> str:
-        """调用 API，支持超时和自动重试"""
-        last_error = None
-        for attempt in range(max_retries + 1):
-            try:
-                # 设置超时：连接超时 10s，读取超时 120s
-                client = OpenAI(
-                    base_url=self.api_base,
-                    api_key="EMPTY",
-                    timeout=120.0,   # 总超时时间
-                    max_retries=0    # 我们手动控制重试
-                )
-                response = client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    max_tokens=self.max_tokens,
-                    temperature=0,
-                )
-                return response.choices[0].message.content
-            except (APIConnectionError, APITimeoutError, ConnectionError, TimeoutError) as e:
-                last_error = e
-                if attempt < max_retries:
-                    wait_time = 2 ** attempt  # 指数退避：1s, 2s, 4s...
-                    print(f"  网络超时，{wait_time}秒后重试 (尝试 {attempt+1}/{max_retries})")
-                    time.sleep(wait_time)
-                else:
-                    raise RuntimeError(f"API调用失败，已达最大重试次数: {e}")
-            except (APIStatusError, RateLimitError) as e:
-                # 服务端错误或限流，也可以重试
-                last_error = e
-                if attempt < max_retries:
-                    wait_time = 2 ** attempt
-                    print(f"  API状态错误 {e.status_code}，{wait_time}秒后重试")
-                    time.sleep(wait_time)
-                else:
-                    raise RuntimeError(f"API调用失败: {e}")
-            except Exception as e:
-                # 其他未知错误，不重试直接抛出
-                raise RuntimeError(f"API调用失败: {e}")
-        # 理论上不会执行到这里
-        raise RuntimeError(f"API调用失败: {last_error}")
+    def _recreate_client(self):
+        self.client = OpenAI(
+            base_url=self.api_base,
+            api_key="EMPTY",
+            timeout=self.request_timeout,
+            max_retries=0,
+        )
 
+
+
+    def call_api(self, messages: list, temperature: float = 0, max_tokens: int = 4090) -> str:
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        url = self.api_base.rstrip("/") + "/chat/completions"
+
+        try:
+            print(f"[DEBUG] POST {url}")
+            print(f"[DEBUG] payload大小: {len(json.dumps(payload, ensure_ascii=False))} bytes")
+
+            resp = requests.post(
+                url,
+                headers={
+                    "Authorization": "Bearer EMPTY",
+                    "Content-Type": "application/json",
+                    "Connection": "close",   # 关键：先禁用长连接复用
+                },
+                json=payload,
+                timeout=(10, 60),  # connect timeout=10s, read timeout=60s
+            )
+
+            print(f"[DEBUG] HTTP状态码: {resp.status_code}")
+            resp.raise_for_status()
+
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+
+        except requests.exceptions.ConnectTimeout as e:
+            raise RuntimeError(f"连接超时: {e}")
+        except requests.exceptions.ReadTimeout as e:
+            raise RuntimeError(f"读取响应超时: {e}")
+        except requests.exceptions.ConnectionError as e:
+            raise RuntimeError(f"连接错误: {e}")
+        except Exception as e:
+            raise RuntimeError(f"HTTP请求失败: {type(e).__name__}: {e}\n{traceback.format_exc()}")
     def parse_json(self, text: str) -> str:
         lines = text.splitlines()
         for i, line in enumerate(lines):
@@ -139,7 +155,7 @@ class DetectorEvaluator:
 
         bbox_str = self.parse_json(bbox_str)
         try:
-            font = ImageFont.truetype("./wqy-microhei.ttc", size=14)
+            font = ImageFont.truetype("./wqy-microhei.ttc", size=20)
         except:
             font = ImageFont.load_default()
 
@@ -201,9 +217,13 @@ class DetectorEvaluator:
             "output_image_path": ""
         }
         try:
+            print(f"[DEBUG] 打开图像: {image_path}")
             original = Image.open(image_path).convert("RGB")
+            print(f"[DEBUG] 原图尺寸: {original.size}")
             resized, scale_w, scale_h = self.resize_image_max_side(original, 1280)
+            print(f"[DEBUG] resize后尺寸: {resized.size}, scale_w={scale_w:.4f}, scale_h={scale_h:.4f}")
             img_b64 = self.pil_to_base64(resized)
+            print(f"[DEBUG] base64长度: {len(img_b64)}")
             img_url = f"data:image/jpeg;base64,{img_b64}"
 
             if mode == "detection":
@@ -222,7 +242,9 @@ class DetectorEvaluator:
                 ]
             }]
 
+            print("[DEBUG] 即将发起API请求")
             response = self.call_api(messages)
+            print("[DEBUG] 已拿到API响应")
             elapsed = time.time() - start
             result["time_sec"] = round(elapsed, 3)
             result["response"] = response
@@ -260,10 +282,12 @@ def run_evaluation(
     model_name: str = "QwenVl",
     prompt_template: str = None,
     mode: str = "detection",
-    delay: float = 1.0
+    delay: float = 1.0,
+    request_timeout: float = 60.0,
+    max_retries: int = 1
 ) -> Dict[str, Any]:
     """执行一次完整评估，返回统计数据和详细记录"""
-    evaluator = DetectorEvaluator(api_base, model_name)
+    evaluator = DetectorEvaluator(api_base, model_name, request_timeout=request_timeout, max_retries=max_retries)
 
     assert prompt_template is not None, "必须提供 prompt_template 参数"
 
@@ -335,7 +359,7 @@ def run_evaluation(
         out_path = os.path.join(dest_folder, out_name)
         res["output_image_path"] = os.path.relpath(out_path, output_dir)
 
-        if cat in ("TP", "FP"):
+        if mode == "detection" and cat in ("TP", "FP"):
             try:
                 original = Image.open(img_path).convert("RGB")
                 _, sw, sh = evaluator.resize_image_max_side(original, 1280)
@@ -406,6 +430,8 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="QwenVl")
     parser.add_argument("--mode", choices=["detection", "vqa"], default="detection")
     parser.add_argument("--delay", type=float, default=1.0)
+    parser.add_argument("--request_timeout", type=float, default=60.0)
+    parser.add_argument("--max_retries", type=int, default=1)
     args = parser.parse_args()
 
     categories = ["夜间火焰", "夜间烟雾", "夜间烟囱烟雾"]
@@ -416,5 +442,7 @@ if __name__ == "__main__":
         api_base=args.api_base,
         model_name=args.model,
         mode=args.mode,
-        delay=args.delay
+        delay=args.delay,
+        request_timeout=args.request_timeout,
+        max_retries=args.max_retries
     )
